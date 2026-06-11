@@ -2,6 +2,8 @@
 
 #include <stddef.h>
 
+#include "cmsis_os2.h"
+
 enum { kDt7FrameLength = 18U };
 
 // DT7 遥控器对象实例
@@ -68,4 +70,10 @@ void Dt7RxCallback(uint8_t *rx_buffer, uint16_t length) {
   g_dt7_object.rocker.wheel =
       (int16_t)((uint16_t)rx_buffer[16] | ((uint16_t)rx_buffer[17] << 8)) -
       (int16_t)kRcChValueOffset;
+  g_dt7_object.last_update_tick = osKernelGetTickCount();
+  g_dt7_object.frame_count++;
 }
+
+uint32_t Dt7FrameCount(void) { return g_dt7_object.frame_count; }
+
+uint32_t Dt7LastUpdateTick(void) { return g_dt7_object.last_update_tick; }

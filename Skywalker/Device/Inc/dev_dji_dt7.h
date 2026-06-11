@@ -74,10 +74,14 @@ typedef struct {
     uint8_t v;      // V键状态
     uint8_t b;      // B键状态
   } key;            // 键盘按键数据
+  volatile uint32_t frame_count;       // 有效遥控帧计数
+  volatile uint32_t last_update_tick;  // 最近一次有效帧的系统tick
 } Dt7Object;
 
 extern Dt7Object g_dt7_object;
 
 void Dt7RxCallback(uint8_t *rx_buffer, uint16_t length);
+uint32_t Dt7FrameCount(void);
+uint32_t Dt7LastUpdateTick(void);
 
 #endif  // DEV_DT7_H

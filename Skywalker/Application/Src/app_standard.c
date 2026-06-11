@@ -20,12 +20,15 @@
 // 方便后续将整车行为作为模板或范例整体替换。
 
 enum {
+  // 1U: 接入裁判系统；0U: 不接入裁判系统，使用本文件内默认参数。
+  kStandardRefereeEnabled = 0U,
   kStandardManagerPeriodMs = 10,
   kStandardGimbalPeriodMs = 2,
   kStandardChassisPeriodMs = 2,
   kStandardShootPeriodMs = 2,
   kStandardMotorCount = 4,
   kStandardCanDataLength = 8,
+  kStandardDt7OfflineTimeoutMs = 100,
 };
 
 static const float kStandardChassisRadiusM = 0.15f;
@@ -217,18 +220,19 @@ static void StandardSharedInit(void) {
     }
     return;
   }
+  memset(&g_standard, 0, sizeof(g_standard));
   g_standard.is_initializing = true;
   (void)osKernelRestoreLock(lock);
 
-  memset(&g_standard, 0, sizeof(g_standard));
-  g_standard.is_initializing = true;
   StandardMotorInit();
   FdcanInit(&hfdcan1, StandardFdcan1RxCallback);
   FdcanInit(&hfdcan2, StandardFdcan2RxCallback);
   FdcanInit(&hfdcan3, StandardFdcan3RxCallback);
   UartInit(&huart5, Dt7RxCallback);
   UartInit(&huart10, VisionProtocolRxCallback);
-  RefereeInit(&g_referee, &huart1, &huart1);
+  if (kStandardRefereeEnabled != 0U) {
+    RefereeInit(&g_referee, &huart1, &huart1);
+  }
 
   DmMotorPackEnable(&g_standard.yaw_motor, g_standard.fdcan2_tx_data);
   FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
@@ -275,7 +279,8 @@ static void StandardApplyChassisPowerLimit(float max_power) {
 }
 
 static float StandardChassisPowerLimit(void) {
-  if (g_referee.game_robot_state.chassis_power_limit > 0U) {
+  if (kStandardRefereeEnabled != 0U &&
+      g_referee.game_robot_state.chassis_power_limit > 0U) {
     return (float)g_referee.game_robot_state.chassis_power_limit;
   }
   return kStandardDefaultChassisPowerW;
@@ -392,20 +397,81 @@ static void StandardShootControl(void) {
                 0x200U);
 }
 
-static void StandardStopAllMotors(void) {
+static void StandardStopChassisMotors(void) {
   for (uint8_t i = 0; i < kStandardMotorCount; i++) {
     g_standard.chassis_motor[i].state.given_omega = 0.0f;
     g_standard.chassis_motor[i].state.given_current = 0.0f;
   }
+}
+
+static void StandardStopGimbalMotors(void) {
   g_standard.pitch_motor.state.given_angle = kStandardPitchOffsetRad;
+  g_standard.pitch_motor.state.given_omega = 0.0f;
+  g_standard.pitch_motor.state.given_current = 0.0f;
   g_standard.yaw_motor.state.given_omega = 0.0f;
+}
+
+static void StandardStopShootMotors(void) {
   g_standard.bullet_feed_motor.state.given_omega = 0.0f;
+  g_standard.bullet_feed_motor.state.given_current = 0.0f;
   g_standard.friction_motor[0].state.given_omega = 0.0f;
+  g_standard.friction_motor[0].state.given_current = 0.0f;
   g_standard.friction_motor[1].state.given_omega = 0.0f;
+  g_standard.friction_motor[1].state.given_current = 0.0f;
+}
+
+static void StandardTransmitGimbalStopCurrents(void) {
+  memset(g_standard.fdcan1_tx_data, 0, sizeof(g_standard.fdcan1_tx_data));
+  DmMotorPackVelocity(&g_standard.yaw_motor, g_standard.fdcan2_tx_data);
+
+  FdcanTransmit(&hfdcan1, g_standard.fdcan1_tx_data, kStandardCanDataLength,
+                0x2FEU);
+  FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
+                DmMotorTxId(&g_standard.yaw_motor));
+}
+
+static void StandardTransmitChassisStopCurrents(void) {
+  memset(g_standard.fdcan3_tx_data, 0, sizeof(g_standard.fdcan3_tx_data));
+
+  FdcanTransmit(&hfdcan3, g_standard.fdcan3_tx_data, kStandardCanDataLength,
+                0x200U);
+}
+
+static void StandardTransmitShootStopCurrents(void) {
+  memset(g_standard.fdcan1_tx_data, 0, sizeof(g_standard.fdcan1_tx_data));
+  memset(g_standard.fdcan3_tx_data, 0, sizeof(g_standard.fdcan3_tx_data));
+
+  FdcanTransmit(&hfdcan1, g_standard.fdcan1_tx_data, kStandardCanDataLength,
+                0x200U);
+  FdcanTransmit(&hfdcan3, g_standard.fdcan3_tx_data, kStandardCanDataLength,
+                0x1FFU);
+}
+
+static bool StandardDt7IsOnline(void) {
+  if (Dt7FrameCount() == 0U) {
+    return false;
+  }
+  return (uint32_t)(osKernelGetTickCount() - Dt7LastUpdateTick()) <=
+         kStandardDt7OfflineTimeoutMs;
 }
 
 static bool StandardIsSafeMode(void) {
-  return SwitchIsDown(g_dt7_object.rocker.sw1);
+  return !StandardDt7IsOnline() || SwitchIsDown(g_dt7_object.rocker.sw1);
+}
+
+static void StandardEnterGimbalSafeMode(void) {
+  StandardStopGimbalMotors();
+  StandardTransmitGimbalStopCurrents();
+}
+
+static void StandardEnterChassisSafeMode(void) {
+  StandardStopChassisMotors();
+  StandardTransmitChassisStopCurrents();
+}
+
+static void StandardEnterShootSafeMode(void) {
+  StandardStopShootMotors();
+  StandardTransmitShootStopCurrents();
 }
 
 static void StandardUpdateVisionTx(void) {
@@ -418,7 +484,9 @@ static void StandardUpdateVisionTx(void) {
   g_gimbal_to_vision.yaw_velocity = g_standard.yaw_motor.state.omega;
   g_gimbal_to_vision.pitch = g_standard.pitch_motor.state.angle;
   g_gimbal_to_vision.pitch_velocity = g_standard.pitch_motor.state.omega;
-  g_gimbal_to_vision.bullet_speed = g_referee.shoot_data.bullet_speed;
+  g_gimbal_to_vision.bullet_speed =
+      (kStandardRefereeEnabled != 0U) ? g_referee.shoot_data.bullet_speed
+                                      : 0.0f;
   g_gimbal_to_vision.bullet_count = g_standard.bullet_count;
 }
 
@@ -428,7 +496,9 @@ uint32_t ManagerTaskInit(void) {
 }
 
 void ManagerTaskLoop(void) {
-  RefereeUpdate(&g_referee);
+  if (kStandardRefereeEnabled != 0U) {
+    RefereeUpdate(&g_referee);
+  }
   StandardUpdateVisionTx();
   VisionProtocolTransmitGimbalState();
 }
@@ -440,7 +510,7 @@ uint32_t GimbalTaskInit(void) {
 
 void GimbalTaskLoop(void) {
   if (StandardIsSafeMode()) {
-    StandardStopAllMotors();
+    StandardEnterGimbalSafeMode();
     return;
   }
   StandardGimbalControl();
@@ -453,7 +523,7 @@ uint32_t ChassisTaskInit(void) {
 
 void ChassisTaskLoop(void) {
   if (StandardIsSafeMode()) {
-    StandardStopAllMotors();
+    StandardEnterChassisSafeMode();
     return;
   }
   StandardChassisControl();
@@ -466,7 +536,7 @@ uint32_t ShootTaskInit(void) {
 
 void ShootTaskLoop(void) {
   if (StandardIsSafeMode()) {
-    StandardStopAllMotors();
+    StandardEnterShootSafeMode();
     return;
   }
   StandardShootControl();
