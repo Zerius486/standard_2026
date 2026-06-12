@@ -22,7 +22,9 @@ enum {
   kUnitTestCanDataLength = 8U,
 };
 
-static const float kUnitTestFdcan3MotorTargetOmegaRadps = 60.0f;
+static const float kUnitTestFdcan3MotorTargetOmegaRadps = 20.0f;
+static const float kUnitTestFdcan3MotorRampRadps2 = 20.0f;
+static const float kUnitTestFdcan3MotorCurrentLimitA = 2.0f;
 
 volatile UnitTestReport g_unit_test_report = {0};
 
@@ -31,6 +33,8 @@ static bool g_unit_test_is_initialized = false;
 static uint32_t g_test_start_tick = 0U;
 static DjiMotor g_fdcan3_motor[kUnitTestMotorCount];
 static uint8_t g_fdcan3_motor_tx_data[kUnitTestCanDataLength];
+static float g_fdcan3_motor_ramp_omega = 0.0f;
+static uint32_t g_fdcan3_motor_last_tick = 0U;
 
 static float UnitTestVectorNorm3(const float value[3]) {
   return sqrtf(value[0] * value[0] + value[1] * value[1] +
@@ -171,9 +175,10 @@ static void UnitTestInitFdcan3MotorSpin(void) {
   for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
     DjiMotorInit(&g_fdcan3_motor[i], kDjiMotorM3508, kDjiMotorModeSpeed,
                  &speed_pid, NULL);
-    g_fdcan3_motor[i].state.given_omega =
-        kUnitTestFdcan3MotorTargetOmegaRadps;
+    g_fdcan3_motor[i].state.given_omega = 0.0f;
   }
+  g_fdcan3_motor_ramp_omega = 0.0f;
+  g_fdcan3_motor_last_tick = osKernelGetTickCount();
   g_unit_test_report.fdcan3_motor_target_omega =
       kUnitTestFdcan3MotorTargetOmegaRadps;
 }
@@ -280,15 +285,69 @@ static void UnitTestPackFdcan3MotorCurrents(void) {
   }
 }
 
+static float UnitTestClampFloat(float value, float min, float max) {
+  if (value > max) {
+    return max;
+  }
+  if (value < min) {
+    return min;
+  }
+  return value;
+}
+
+static bool UnitTestFdcan3AllMotorsHaveFeedback(void) {
+  for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
+    if (g_unit_test_report.fdcan3_motor_rx_count[i] == 0U) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void UnitTestUpdateFdcan3MotorRamp(void) {
+  uint32_t now = osKernelGetTickCount();
+  uint32_t elapsed_ms = now - g_fdcan3_motor_last_tick;
+  g_fdcan3_motor_last_tick = now;
+  float step = kUnitTestFdcan3MotorRampRadps2 * (float)elapsed_ms * 0.001f;
+
+  if (g_fdcan3_motor_ramp_omega < kUnitTestFdcan3MotorTargetOmegaRadps) {
+    g_fdcan3_motor_ramp_omega += step;
+    if (g_fdcan3_motor_ramp_omega > kUnitTestFdcan3MotorTargetOmegaRadps) {
+      g_fdcan3_motor_ramp_omega = kUnitTestFdcan3MotorTargetOmegaRadps;
+    }
+  } else if (g_fdcan3_motor_ramp_omega >
+             kUnitTestFdcan3MotorTargetOmegaRadps) {
+    g_fdcan3_motor_ramp_omega -= step;
+    if (g_fdcan3_motor_ramp_omega < kUnitTestFdcan3MotorTargetOmegaRadps) {
+      g_fdcan3_motor_ramp_omega = kUnitTestFdcan3MotorTargetOmegaRadps;
+    }
+  }
+}
+
 static void UnitTestUpdateFdcan3MotorSpin(void) {
   if (!UnitTestIsSelected(kUnitTestFdcan3MotorSpin)) {
     return;
   }
 
+  bool all_motors_have_feedback = UnitTestFdcan3AllMotorsHaveFeedback();
+  if (all_motors_have_feedback) {
+    UnitTestUpdateFdcan3MotorRamp();
+  } else {
+    g_fdcan3_motor_ramp_omega = 0.0f;
+    g_fdcan3_motor_last_tick = osKernelGetTickCount();
+  }
+
   for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
-    g_fdcan3_motor[i].state.given_omega =
-        kUnitTestFdcan3MotorTargetOmegaRadps;
-    DjiMotorCurrentCalculate(&g_fdcan3_motor[i]);
+    g_fdcan3_motor[i].state.given_omega = g_fdcan3_motor_ramp_omega;
+    if (all_motors_have_feedback) {
+      DjiMotorCurrentCalculate(&g_fdcan3_motor[i]);
+      g_fdcan3_motor[i].state.given_current = UnitTestClampFloat(
+          g_fdcan3_motor[i].state.given_current,
+          -kUnitTestFdcan3MotorCurrentLimitA,
+          kUnitTestFdcan3MotorCurrentLimitA);
+    } else {
+      g_fdcan3_motor[i].state.given_current = 0.0f;
+    }
     g_unit_test_report.fdcan3_motor_omega[i] =
         g_fdcan3_motor[i].state.omega;
     g_unit_test_report.fdcan3_motor_current[i] =
@@ -302,14 +361,6 @@ static void UnitTestUpdateFdcan3MotorSpin(void) {
   UnitTestPackFdcan3MotorCurrents();
   FdcanTransmit(&hfdcan3, g_fdcan3_motor_tx_data, kUnitTestCanDataLength,
                 0x200U);
-
-  bool all_motors_have_feedback = true;
-  for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
-    if (g_unit_test_report.fdcan3_motor_rx_count[i] == 0U) {
-      all_motors_have_feedback = false;
-      break;
-    }
-  }
 
   if (all_motors_have_feedback) {
     UnitTestItemPass(&g_unit_test_report.fdcan);
