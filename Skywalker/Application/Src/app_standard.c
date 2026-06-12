@@ -44,6 +44,8 @@ static const float kStandardWheelRadiusM = 0.01f;
 static const float kStandardMaxVxMps = 5.0f;
 static const float kStandardMaxVyMps = 5.0f;
 static const float kStandardMaxOmegaRadps = 10.0f;
+static const float kStandardChassisCurrentLimitA = 12.0f;
+static const float kStandardChassisCurrentSlewRateAps = 300.0f;
 static const float kStandardPitchOffsetRad = -1.66286434f;
 static const float kStandardYawManualScale = 0.5f;
 static const float kStandardPitchMouseScale = 0.5f;
@@ -89,6 +91,7 @@ typedef struct {
   uint8_t fdcan2_tx_data[kStandardCanDataLength];
   uint8_t fdcan3_tx_data[kStandardCanDataLength];
   uint16_t bullet_count;
+  uint32_t chassis_last_tick;
   volatile bool is_initialized;
   volatile bool is_initializing;
 } StandardApp;
@@ -111,6 +114,16 @@ static float StandardClamp(float value, float min, float max) {
 
 static float StandardRcNormalize(int16_t value) {
   return StandardClamp((float)value / 660.0f, -1.0f, 1.0f);
+}
+
+static float StandardSlewFloat(float current, float target, float max_step) {
+  if (target > current + max_step) {
+    return current + max_step;
+  }
+  if (target < current - max_step) {
+    return current - max_step;
+  }
+  return target;
 }
 
 static void StandardPackDjiCurrents(const DjiMotor *motor_0,
@@ -259,6 +272,7 @@ static void StandardSharedInit(void) {
     FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
                   DmMotorTxId(&g_standard.yaw_motor));
   }
+  g_standard.chassis_last_tick = osKernelGetTickCount();
   g_standard.is_initialized = true;
   g_standard.is_initializing = false;
 }
@@ -343,8 +357,20 @@ static void StandardChassisKinematics(void) {
 
 static void StandardChassisControl(void) {
   StandardChassisKinematics();
+  uint32_t now = osKernelGetTickCount();
+  uint32_t elapsed_ms = now - g_standard.chassis_last_tick;
+  g_standard.chassis_last_tick = now;
+  float max_current_step =
+      kStandardChassisCurrentSlewRateAps * (float)elapsed_ms * 0.001f;
+
   for (uint8_t i = 0; i < kStandardMotorCount; i++) {
+    float previous_current = g_standard.chassis_motor[i].state.given_current;
     DjiMotorCurrentCalculate(&g_standard.chassis_motor[i]);
+    float target_current = StandardClamp(
+        g_standard.chassis_motor[i].state.given_current,
+        -kStandardChassisCurrentLimitA, kStandardChassisCurrentLimitA);
+    g_standard.chassis_motor[i].state.given_current =
+        StandardSlewFloat(previous_current, target_current, max_current_step);
   }
   if (kStandardRefereeEnabled != 0U) {
     StandardApplyChassisPowerLimit(StandardChassisPowerLimit());
@@ -428,6 +454,7 @@ static void StandardStopChassisMotors(void) {
     g_standard.chassis_motor[i].state.given_omega = 0.0f;
     g_standard.chassis_motor[i].state.given_current = 0.0f;
   }
+  g_standard.chassis_last_tick = osKernelGetTickCount();
 }
 
 static void StandardStopGimbalMotors(void) {
