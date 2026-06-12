@@ -23,8 +23,8 @@
 enum {
   // 1U: 接入裁判系统；0U: 不接入裁判系统，使用本文件内默认参数。
   kStandardRefereeEnabled = 0U,
-  // 当前测试：FDCAN3上的4个M3508按固定目标速度匀速转动。
-  kStandardUnitTestMask = kUnitTestFdcan3MotorSpin,
+  // 当前测试：DT7左摇杆控制FDCAN3上的4个M3508底盘平移。
+  kStandardUnitTestMask = kUnitTestRemoteChassisDrive,
   kStandardManagerPeriodMs = 10,
   kStandardGimbalPeriodMs = 2,
   kStandardChassisPeriodMs = 2,

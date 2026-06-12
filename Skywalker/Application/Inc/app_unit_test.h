@@ -12,8 +12,10 @@ typedef enum {
   kUnitTestImu = (1U << 2),
   kUnitTestUart = (1U << 3),
   kUnitTestFdcan3MotorSpin = (1U << 4),
+  kUnitTestRemoteChassisDrive = (1U << 5),
   kUnitTestAll = kUnitTestRemote | kUnitTestFdcan | kUnitTestImu |
-                 kUnitTestUart | kUnitTestFdcan3MotorSpin,
+                 kUnitTestUart | kUnitTestFdcan3MotorSpin |
+                 kUnitTestRemoteChassisDrive,
 } UnitTestMask;
 
 typedef enum {
@@ -43,12 +45,15 @@ typedef struct {
   uint8_t remote_sw1;
   uint8_t remote_sw2;
   int16_t remote_ch[5];
+  float remote_drive_vx;
+  float remote_drive_vy;
 
   uint32_t fdcan_rx_count[3];
   uint32_t fdcan_last_id[3];
   uint8_t fdcan_last_data[3][8];
   uint32_t fdcan3_motor_rx_count[4];
   float fdcan3_motor_target_omega;
+  float fdcan3_motor_given_omega[4];
   float fdcan3_motor_omega[4];
   float fdcan3_motor_current[4];
   float fdcan3_motor_given_current[4];

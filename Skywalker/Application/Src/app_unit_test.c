@@ -25,6 +25,12 @@ enum {
 static const float kUnitTestFdcan3MotorTargetOmegaRadps = 20.0f;
 static const float kUnitTestFdcan3MotorRampRadps2 = 20.0f;
 static const float kUnitTestFdcan3MotorCurrentLimitA = 2.0f;
+static const float kUnitTestRemoteDriveMaxVxMps = 0.8f;
+static const float kUnitTestRemoteDriveMaxVyMps = 0.8f;
+static const float kUnitTestRemoteDriveWheelRadiusM = 0.01f;
+static const float kUnitTestRemoteDriveWheelRampRadps2 = 80.0f;
+static const float kUnitTestRemoteDriveDeadband = 0.05f;
+static const float kUnitTestRemoteDriveCurrentLimitA = 2.0f;
 
 volatile UnitTestReport g_unit_test_report = {0};
 
@@ -34,6 +40,7 @@ static uint32_t g_test_start_tick = 0U;
 static DjiMotor g_fdcan3_motor[kUnitTestMotorCount];
 static uint8_t g_fdcan3_motor_tx_data[kUnitTestCanDataLength];
 static float g_fdcan3_motor_ramp_omega = 0.0f;
+static float g_fdcan3_motor_target_omega[kUnitTestMotorCount];
 static uint32_t g_fdcan3_motor_last_tick = 0U;
 
 static float UnitTestVectorNorm3(const float value[3]) {
@@ -43,6 +50,15 @@ static float UnitTestVectorNorm3(const float value[3]) {
 
 static bool UnitTestIsSelected(UnitTestMask mask) {
   return (g_unit_test_mask & (uint32_t)mask) != 0U;
+}
+
+static bool UnitTestIsRemoteChassisDriveSelected(void) {
+  return UnitTestIsSelected(kUnitTestRemoteChassisDrive);
+}
+
+static bool UnitTestIsFdcan3MotorSelected(void) {
+  return UnitTestIsSelected(kUnitTestFdcan3MotorSpin) ||
+         UnitTestIsRemoteChassisDriveSelected();
 }
 
 static void UnitTestItemDisable(volatile UnitTestItemReport *item) {
@@ -126,7 +142,7 @@ static void UnitTestFdcan2RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
 
 static void UnitTestFdcan3RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
   UnitTestFdcanRecord(2U, std_id, rx_buffer);
-  if (UnitTestIsSelected(kUnitTestFdcan3MotorSpin) && std_id >= 0x201U &&
+  if (UnitTestIsFdcan3MotorSelected() && std_id >= 0x201U &&
       std_id <= 0x204U) {
     uint8_t index = (uint8_t)(std_id - 0x201U);
     DjiMotorUpdate(&g_fdcan3_motor[index], rx_buffer);
@@ -135,7 +151,8 @@ static void UnitTestFdcan3RxCallback(uint32_t std_id, uint8_t *rx_buffer) {
 }
 
 static void UnitTestInitRemote(void) {
-  if (UnitTestIsSelected(kUnitTestRemote)) {
+  if (UnitTestIsSelected(kUnitTestRemote) ||
+      UnitTestIsRemoteChassisDriveSelected()) {
     UartInit(&huart5, UnitTestRemoteRxCallback);
     UnitTestItemRun(&g_unit_test_report.remote);
   } else {
@@ -145,7 +162,7 @@ static void UnitTestInitRemote(void) {
 
 static void UnitTestInitFdcan(void) {
   if (UnitTestIsSelected(kUnitTestFdcan) ||
-      UnitTestIsSelected(kUnitTestFdcan3MotorSpin)) {
+      UnitTestIsFdcan3MotorSelected()) {
     if (UnitTestIsSelected(kUnitTestFdcan)) {
       FdcanInit(&hfdcan1, UnitTestFdcan1RxCallback);
       FdcanInit(&hfdcan2, UnitTestFdcan2RxCallback);
@@ -158,7 +175,7 @@ static void UnitTestInitFdcan(void) {
 }
 
 static void UnitTestInitFdcan3MotorSpin(void) {
-  if (!UnitTestIsSelected(kUnitTestFdcan3MotorSpin)) {
+  if (!UnitTestIsFdcan3MotorSelected()) {
     return;
   }
 
@@ -176,11 +193,14 @@ static void UnitTestInitFdcan3MotorSpin(void) {
     DjiMotorInit(&g_fdcan3_motor[i], kDjiMotorM3508, kDjiMotorModeSpeed,
                  &speed_pid, NULL);
     g_fdcan3_motor[i].state.given_omega = 0.0f;
+    g_fdcan3_motor_target_omega[i] = 0.0f;
   }
   g_fdcan3_motor_ramp_omega = 0.0f;
   g_fdcan3_motor_last_tick = osKernelGetTickCount();
   g_unit_test_report.fdcan3_motor_target_omega =
-      kUnitTestFdcan3MotorTargetOmegaRadps;
+      UnitTestIsSelected(kUnitTestFdcan3MotorSpin)
+          ? kUnitTestFdcan3MotorTargetOmegaRadps
+          : 0.0f;
 }
 
 static void UnitTestInitImu(void) {
@@ -231,7 +251,8 @@ uint32_t UnitTestInit(uint32_t selected_mask) {
 }
 
 static void UnitTestUpdateRemote(void) {
-  if (!UnitTestIsSelected(kUnitTestRemote)) {
+  if (!UnitTestIsSelected(kUnitTestRemote) &&
+      !UnitTestIsRemoteChassisDriveSelected()) {
     return;
   }
 
@@ -259,7 +280,7 @@ static void UnitTestUpdateRemote(void) {
 
 static void UnitTestUpdateFdcan(void) {
   if (!UnitTestIsSelected(kUnitTestFdcan) &&
-      !UnitTestIsSelected(kUnitTestFdcan3MotorSpin)) {
+      !UnitTestIsFdcan3MotorSelected()) {
     return;
   }
 
@@ -295,6 +316,29 @@ static float UnitTestClampFloat(float value, float min, float max) {
   return value;
 }
 
+static float UnitTestRcNormalize(int16_t value) {
+  return UnitTestClampFloat((float)value / 660.0f, -1.0f, 1.0f);
+}
+
+static float UnitTestApplyDeadband(float value, float deadband) {
+  if (value > -deadband && value < deadband) {
+    return 0.0f;
+  }
+  return value;
+}
+
+static float UnitTestRampFloat(float current, float target, float step) {
+  if (current < target) {
+    current += step;
+    return (current > target) ? target : current;
+  }
+  if (current > target) {
+    current -= step;
+    return (current < target) ? target : current;
+  }
+  return current;
+}
+
 static bool UnitTestFdcan3AllMotorsHaveFeedback(void) {
   for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
     if (g_unit_test_report.fdcan3_motor_rx_count[i] == 0U) {
@@ -322,6 +366,23 @@ static void UnitTestUpdateFdcan3MotorRamp(void) {
       g_fdcan3_motor_ramp_omega = kUnitTestFdcan3MotorTargetOmegaRadps;
     }
   }
+}
+
+static void UnitTestStopFdcan3Motors(void) {
+  for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
+    g_fdcan3_motor_target_omega[i] = 0.0f;
+    g_fdcan3_motor[i].state.given_omega = 0.0f;
+    g_fdcan3_motor[i].state.given_current = 0.0f;
+  }
+  memset(g_fdcan3_motor_tx_data, 0, sizeof(g_fdcan3_motor_tx_data));
+  FdcanTransmit(&hfdcan3, g_fdcan3_motor_tx_data, kUnitTestCanDataLength,
+                0x200U);
+}
+
+static bool UnitTestRemoteIsOnline(void) {
+  uint32_t now = osKernelGetTickCount();
+  return Dt7FrameCount() > 0U &&
+         (uint32_t)(now - Dt7LastUpdateTick()) <= kUnitTestRemoteTimeoutMs;
 }
 
 static void UnitTestUpdateFdcan3MotorSpin(void) {
@@ -367,6 +428,92 @@ static void UnitTestUpdateFdcan3MotorSpin(void) {
   } else if ((uint32_t)(osKernelGetTickCount() - g_test_start_tick) >
              kUnitTestFdcanTimeoutMs) {
     UnitTestItemFail(&g_unit_test_report.fdcan, 2U);
+  }
+}
+
+static void UnitTestUpdateRemoteChassisDriveTarget(float target_omega[4]) {
+  float vx_input = UnitTestApplyDeadband(
+      -UnitTestRcNormalize(g_dt7_object.rocker.ch3),
+      kUnitTestRemoteDriveDeadband);
+  float vy_input = UnitTestApplyDeadband(
+      UnitTestRcNormalize(g_dt7_object.rocker.ch2),
+      kUnitTestRemoteDriveDeadband);
+
+  float vx = vx_input * kUnitTestRemoteDriveMaxVxMps;
+  float vy = vy_input * kUnitTestRemoteDriveMaxVyMps;
+
+  g_unit_test_report.remote_drive_vx = vx;
+  g_unit_test_report.remote_drive_vy = vy;
+
+  target_omega[0] = (-0.707f * vx + 0.707f * vy) /
+                    kUnitTestRemoteDriveWheelRadiusM;
+  target_omega[1] = (-0.707f * vx - 0.707f * vy) /
+                    kUnitTestRemoteDriveWheelRadiusM;
+  target_omega[2] = (0.707f * vx - 0.707f * vy) /
+                    kUnitTestRemoteDriveWheelRadiusM;
+  target_omega[3] = (0.707f * vx + 0.707f * vy) /
+                    kUnitTestRemoteDriveWheelRadiusM;
+}
+
+static void UnitTestUpdateRemoteChassisDrive(void) {
+  if (!UnitTestIsRemoteChassisDriveSelected()) {
+    return;
+  }
+
+  bool ready = UnitTestRemoteIsOnline() && UnitTestFdcan3AllMotorsHaveFeedback();
+  uint32_t now = osKernelGetTickCount();
+  uint32_t elapsed_ms = now - g_fdcan3_motor_last_tick;
+  g_fdcan3_motor_last_tick = now;
+
+  float target_omega[kUnitTestMotorCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (ready) {
+    UnitTestUpdateRemoteChassisDriveTarget(target_omega);
+  } else {
+    g_unit_test_report.remote_drive_vx = 0.0f;
+    g_unit_test_report.remote_drive_vy = 0.0f;
+  }
+
+  float step =
+      kUnitTestRemoteDriveWheelRampRadps2 * (float)elapsed_ms * 0.001f;
+  for (uint8_t i = 0; i < kUnitTestMotorCount; i++) {
+    g_fdcan3_motor_target_omega[i] = target_omega[i];
+    g_fdcan3_motor[i].state.given_omega = UnitTestRampFloat(
+        g_fdcan3_motor[i].state.given_omega, target_omega[i], step);
+
+    if (ready) {
+      DjiMotorCurrentCalculate(&g_fdcan3_motor[i]);
+      g_fdcan3_motor[i].state.given_current = UnitTestClampFloat(
+          g_fdcan3_motor[i].state.given_current,
+          -kUnitTestRemoteDriveCurrentLimitA,
+          kUnitTestRemoteDriveCurrentLimitA);
+    } else {
+      g_fdcan3_motor[i].state.given_current = 0.0f;
+    }
+
+    g_unit_test_report.fdcan3_motor_given_omega[i] =
+        g_fdcan3_motor[i].state.given_omega;
+    g_unit_test_report.fdcan3_motor_omega[i] =
+        g_fdcan3_motor[i].state.omega;
+    g_unit_test_report.fdcan3_motor_current[i] =
+        g_fdcan3_motor[i].state.current;
+    g_unit_test_report.fdcan3_motor_given_current[i] =
+        g_fdcan3_motor[i].state.given_current;
+    g_unit_test_report.fdcan3_motor_temperature[i] =
+        (uint8_t)g_fdcan3_motor[i].state.temperature;
+  }
+
+  if (ready) {
+    UnitTestPackFdcan3MotorCurrents();
+    FdcanTransmit(&hfdcan3, g_fdcan3_motor_tx_data, kUnitTestCanDataLength,
+                  0x200U);
+    UnitTestItemPass(&g_unit_test_report.fdcan);
+  } else {
+    UnitTestStopFdcan3Motors();
+    if (!UnitTestRemoteIsOnline()) {
+      UnitTestItemFail(&g_unit_test_report.remote, 1U);
+    } else if ((uint32_t)(now - g_test_start_tick) > kUnitTestFdcanTimeoutMs) {
+      UnitTestItemFail(&g_unit_test_report.fdcan, 2U);
+    }
   }
 }
 
@@ -436,6 +583,7 @@ void UnitTestLoop(void) {
   UnitTestUpdateRemote();
   UnitTestUpdateFdcan();
   UnitTestUpdateFdcan3MotorSpin();
+  UnitTestUpdateRemoteChassisDrive();
   UnitTestUpdateImu();
   UnitTestUpdateUart();
 }
