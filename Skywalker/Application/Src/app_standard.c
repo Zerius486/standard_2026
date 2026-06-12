@@ -11,10 +11,12 @@
 #include "bsp_uart.h"
 #include "cmsis_os2.h"
 #include "app_unit_test.h"
+#include "dev_bmi088.h"
 #include "dev_dji_dt7.h"
 #include "dev_dji_motor.h"
 #include "dev_dm_motor.h"
 #include "fdcan.h"
+#include "spi.h"
 #include "usart.h"
 
 // 上赛季Standard机器人的Skywalker版重写。这个文件集中覆盖四个RTOS任务入口，
@@ -37,6 +39,7 @@ enum {
   kStandardMotorCount = 4,
   kStandardCanDataLength = 8,
   kStandardDt7OfflineTimeoutMs = 100,
+  kStandardImuGyroZAxis = 2,
 };
 
 static const float kStandardChassisRadiusM = 0.15f;
@@ -44,8 +47,10 @@ static const float kStandardWheelRadiusM = 0.01f;
 static const float kStandardMaxVxMps = 5.0f;
 static const float kStandardMaxVyMps = 5.0f;
 static const float kStandardMaxOmegaRadps = 10.0f;
-static const float kStandardChassisCurrentLimitA = 12.0f;
-static const float kStandardChassisCurrentSlewRateAps = 300.0f;
+static const float kStandardNoRefereeCurrentScale = 0.5f;
+static const float kStandardChassisYawRateFeedbackKp = 0.5f;
+static const float kStandardChassisAutoSpinOmegaRadps = 4.0f;
+static const float kStandardImuYawRateSign = 1.0f;
 static const float kStandardPitchOffsetRad = -1.66286434f;
 static const float kStandardYawManualScale = 0.5f;
 static const float kStandardPitchMouseScale = 0.5f;
@@ -70,6 +75,10 @@ typedef struct {
   StandardVelocity desired_velocity;
   StandardVelocity actual_velocity;
   float estimated_power;
+  float yaw_angle;
+  float yaw_rate;
+  Bmi088Status imu_status;
+  bool imu_ready;
 } StandardChassisState;
 
 typedef struct {
@@ -91,7 +100,7 @@ typedef struct {
   uint8_t fdcan2_tx_data[kStandardCanDataLength];
   uint8_t fdcan3_tx_data[kStandardCanDataLength];
   uint16_t bullet_count;
-  uint32_t chassis_last_tick;
+  uint32_t chassis_imu_last_tick;
   volatile bool is_initialized;
   volatile bool is_initializing;
 } StandardApp;
@@ -116,14 +125,14 @@ static float StandardRcNormalize(int16_t value) {
   return StandardClamp((float)value / 660.0f, -1.0f, 1.0f);
 }
 
-static float StandardSlewFloat(float current, float target, float max_step) {
-  if (target > current + max_step) {
-    return current + max_step;
+static float StandardWrapPi(float angle) {
+  while (angle > (float)M_PI) {
+    angle -= 2.0f * (float)M_PI;
   }
-  if (target < current - max_step) {
-    return current - max_step;
+  while (angle < -(float)M_PI) {
+    angle += 2.0f * (float)M_PI;
   }
-  return target;
+  return angle;
 }
 
 static void StandardPackDjiCurrents(const DjiMotor *motor_0,
@@ -266,13 +275,22 @@ static void StandardSharedInit(void) {
   if (kStandardRefereeEnabled != 0U) {
     RefereeInit(&g_referee, &huart1, &huart1);
   }
+  if (kStandardChassisEnabled != 0U) {
+    g_standard.chassis.imu_status = Bmi088Init(&g_bmi088, &hspi2);
+    if (g_standard.chassis.imu_status == kBmi088NoError) {
+      g_standard.chassis.imu_status =
+          Bmi088CalibrateGyroOffset(&g_bmi088, 300U, 1U);
+      g_standard.chassis.imu_ready =
+          g_standard.chassis.imu_status == kBmi088NoError;
+    }
+  }
 
   if (kStandardGimbalEnabled != 0U) {
     DmMotorPackEnable(&g_standard.yaw_motor, g_standard.fdcan2_tx_data);
     FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
                   DmMotorTxId(&g_standard.yaw_motor));
   }
-  g_standard.chassis_last_tick = osKernelGetTickCount();
+  g_standard.chassis_imu_last_tick = osKernelGetTickCount();
   g_standard.is_initialized = true;
   g_standard.is_initializing = false;
 }
@@ -322,24 +340,65 @@ static float StandardChassisPowerLimit(void) {
   return kStandardDefaultChassisPowerW;
 }
 
+static void StandardChassisImuUpdate(void) {
+  uint32_t now = osKernelGetTickCount();
+  uint32_t elapsed_ms = now - g_standard.chassis_imu_last_tick;
+  g_standard.chassis_imu_last_tick = now;
+
+  if (!g_standard.chassis.imu_ready) {
+    return;
+  }
+
+  Bmi088Status status = Bmi088Update(&g_bmi088);
+  g_standard.chassis.imu_status = status;
+  if (status != kBmi088NoError) {
+    g_standard.chassis.imu_ready = false;
+    g_standard.chassis.yaw_rate = 0.0f;
+    return;
+  }
+
+  float yaw_rate =
+      kStandardImuYawRateSign * g_bmi088.corrected_gyro[kStandardImuGyroZAxis];
+  g_standard.chassis.yaw_rate = yaw_rate;
+  g_standard.chassis.yaw_angle = StandardWrapPi(
+      g_standard.chassis.yaw_angle + yaw_rate * (float)elapsed_ms * 0.001f);
+}
+
 static void StandardChassisKinematics(void) {
   float vx_input = -StandardRcNormalize(g_dt7_object.rocker.ch3) -
                    (float)g_dt7_object.key.w + (float)g_dt7_object.key.s;
   float vy_input = StandardRcNormalize(g_dt7_object.rocker.ch2) +
                    (float)g_dt7_object.key.a - (float)g_dt7_object.key.d;
-  float wz_input = -StandardRcNormalize(g_dt7_object.rocker.wheel) -
-                   (float)g_dt7_object.key.q + (float)g_dt7_object.key.e;
+  float desired_yaw_rate =
+      (-StandardRcNormalize(g_dt7_object.rocker.wheel) -
+       (float)g_dt7_object.key.q + (float)g_dt7_object.key.e) *
+      kStandardMaxOmegaRadps;
+  if (SwitchIsUp(g_dt7_object.rocker.sw1)) {
+    desired_yaw_rate += kStandardChassisAutoSpinOmegaRadps;
+  }
 
   g_standard.chassis.desired_velocity.vx =
       StandardClamp(vx_input, -1.0f, 1.0f) * kStandardMaxVxMps;
   g_standard.chassis.desired_velocity.vy =
       StandardClamp(vy_input, -1.0f, 1.0f) * kStandardMaxVyMps;
-  g_standard.chassis.desired_velocity.omega_z =
-      StandardClamp(wz_input, -1.0f, 1.0f) * kStandardMaxOmegaRadps;
+  g_standard.chassis.desired_velocity.omega_z = desired_yaw_rate;
 
-  float vx = g_standard.chassis.desired_velocity.vx;
-  float vy = g_standard.chassis.desired_velocity.vy;
-  float wz = g_standard.chassis.desired_velocity.omega_z;
+  float field_vx = g_standard.chassis.desired_velocity.vx;
+  float field_vy = g_standard.chassis.desired_velocity.vy;
+  float yaw = g_standard.chassis.imu_ready ? g_standard.chassis.yaw_angle : 0.0f;
+  float cos_yaw = cosf(yaw);
+  float sin_yaw = sinf(yaw);
+  float vx = cos_yaw * field_vx + sin_yaw * field_vy;
+  float vy = -sin_yaw * field_vx + cos_yaw * field_vy;
+  float wz = desired_yaw_rate;
+  if (g_standard.chassis.imu_ready) {
+    wz += kStandardChassisYawRateFeedbackKp *
+          (desired_yaw_rate - g_standard.chassis.yaw_rate);
+  }
+  wz = StandardClamp(wz, -kStandardMaxOmegaRadps, kStandardMaxOmegaRadps);
+  g_standard.chassis.actual_velocity.vx = vx;
+  g_standard.chassis.actual_velocity.vy = vy;
+  g_standard.chassis.actual_velocity.omega_z = g_standard.chassis.yaw_rate;
   float rotation_speed = wz * kStandardChassisRadiusM;
 
   g_standard.chassis_motor[0].state.given_omega =
@@ -356,25 +415,19 @@ static void StandardChassisKinematics(void) {
 }
 
 static void StandardChassisControl(void) {
+  StandardChassisImuUpdate();
   StandardChassisKinematics();
-  uint32_t now = osKernelGetTickCount();
-  uint32_t elapsed_ms = now - g_standard.chassis_last_tick;
-  g_standard.chassis_last_tick = now;
-  float max_current_step =
-      kStandardChassisCurrentSlewRateAps * (float)elapsed_ms * 0.001f;
 
   for (uint8_t i = 0; i < kStandardMotorCount; i++) {
-    float previous_current = g_standard.chassis_motor[i].state.given_current;
     DjiMotorCurrentCalculate(&g_standard.chassis_motor[i]);
-    float target_current = StandardClamp(
-        g_standard.chassis_motor[i].state.given_current,
-        -kStandardChassisCurrentLimitA, kStandardChassisCurrentLimitA);
-    g_standard.chassis_motor[i].state.given_current =
-        StandardSlewFloat(previous_current, target_current, max_current_step);
   }
   if (kStandardRefereeEnabled != 0U) {
     StandardApplyChassisPowerLimit(StandardChassisPowerLimit());
   } else {
+    for (uint8_t i = 0; i < kStandardMotorCount; i++) {
+      g_standard.chassis_motor[i].state.given_current *=
+          kStandardNoRefereeCurrentScale;
+    }
     g_standard.chassis.estimated_power = StandardEstimateChassisPower();
   }
   StandardPackDjiCurrents(&g_standard.chassis_motor[0],
@@ -454,7 +507,7 @@ static void StandardStopChassisMotors(void) {
     g_standard.chassis_motor[i].state.given_omega = 0.0f;
     g_standard.chassis_motor[i].state.given_current = 0.0f;
   }
-  g_standard.chassis_last_tick = osKernelGetTickCount();
+  g_standard.chassis_imu_last_tick = osKernelGetTickCount();
 }
 
 static void StandardStopGimbalMotors(void) {
