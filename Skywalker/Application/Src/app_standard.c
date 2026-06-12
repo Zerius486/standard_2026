@@ -46,14 +46,14 @@ static const float kStandardMaxVyMps = 0.8f;
 static const float kStandardMaxOmegaRadps = 0.0f;
 static const float kStandardRcDeadband = 0.05f;
 static const float kStandardChassisWheelRampRadps2 = 400.0f;
-static const float kStandardChassisCurrentLimitA = 2.0f;
+static const float kStandardChassisCurrentLimitA = 6.0f;
 static const float kStandardPitchOffsetRad = -1.66286434f;
 static const float kStandardYawManualScale = 0.5f;
 static const float kStandardPitchMouseScale = 0.5f;
 static const float kStandardPitchRockerScale = 5.0f;
 static const float kStandardBulletFeedOmegaRadps = 500.0f;
 static const float kStandardFrictionOmegaRadps = 800.0f;
-static const float kStandardDefaultChassisPowerW = 45.0f;
+static const float kStandardDefaultChassisPowerW = 100.0f;
 
 // M3508底盘功率估计参数，保留旧车测试得到的基础模型。
 static const float kStandardPowerK0 = 0.30f;
@@ -382,7 +382,11 @@ static void StandardChassisControl(void) {
         g_standard.chassis_motor[i].state.given_current,
         -kStandardChassisCurrentLimitA, kStandardChassisCurrentLimitA);
   }
-  StandardApplyChassisPowerLimit(StandardChassisPowerLimit());
+  if (kStandardRefereeEnabled != 0U) {
+    StandardApplyChassisPowerLimit(StandardChassisPowerLimit());
+  } else {
+    g_standard.chassis.estimated_power = StandardEstimateChassisPower();
+  }
   StandardPackDjiCurrents(&g_standard.chassis_motor[0],
                           &g_standard.chassis_motor[1],
                           &g_standard.chassis_motor[2],
