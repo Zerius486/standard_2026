@@ -83,7 +83,10 @@ static void UnitTestItemFail(volatile UnitTestItemReport *item,
   item->last_error = error;
 }
 
+static void UnitTestRecordUartRx(UART_HandleTypeDef *huart, uint16_t length);
+
 static void UnitTestRemoteRxCallback(uint8_t *rx_buffer, uint16_t length) {
+  UnitTestRecordUartRx(&huart5, length);
   Dt7RxCallback(rx_buffer, length);
 }
 

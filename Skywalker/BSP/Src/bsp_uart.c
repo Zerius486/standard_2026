@@ -6,8 +6,9 @@
 #include "stm32h7xx_hal.h"
 #include "usart.h"
 
-// UART对象实例
-UartObject g_uart_object[kUartNbr] = {0};
+// H7 DMA无法访问DTCM，将UART DMA缓冲区放到DMA可访问SRAM。
+UartObject g_uart_object[kUartNbr] __attribute__((section(".dma_buffer"),
+                                                 aligned(32)));
 
 /**
  * @brief 获取UART对象实例索引
@@ -64,6 +65,7 @@ void UartInit(UART_HandleTypeDef *huart, UartRxCallback callback) {
     return;
   }
 
+  memset(&g_uart_object[index], 0, sizeof(g_uart_object[index]));
   g_uart_object[index].huart = huart;
   g_uart_object[index].callback = callback;
   g_uart_object[index].rx_buffer_active = g_uart_object[index].rx_buffer_0;
