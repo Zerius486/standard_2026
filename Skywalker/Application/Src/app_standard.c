@@ -23,8 +23,13 @@
 enum {
   // 1U: 接入裁判系统；0U: 不接入裁判系统，使用本文件内默认参数。
   kStandardRefereeEnabled = 0U,
-  // 当前测试：DT7左摇杆控制FDCAN3上的4个M3508底盘平移。
-  kStandardUnitTestMask = kUnitTestRemoteChassisDrive,
+  // 只接底盘时先关闭云台、发射和视觉链路，只跑DT7 + FDCAN3底盘。
+  kStandardChassisEnabled = 1U,
+  kStandardGimbalEnabled = 0U,
+  kStandardShootEnabled = 0U,
+  kStandardVisionEnabled = 0U,
+  kStandardRemoteSwitchSafeModeEnabled = 0U,
+  kStandardUnitTestMask = kUnitTestNone,
   kStandardManagerPeriodMs = 10,
   kStandardGimbalPeriodMs = 2,
   kStandardChassisPeriodMs = 2,
@@ -36,9 +41,12 @@ enum {
 
 static const float kStandardChassisRadiusM = 0.15f;
 static const float kStandardWheelRadiusM = 0.01f;
-static const float kStandardMaxVxMps = 5.0f;
-static const float kStandardMaxVyMps = 5.0f;
-static const float kStandardMaxOmegaRadps = 10.0f;
+static const float kStandardMaxVxMps = 0.8f;
+static const float kStandardMaxVyMps = 0.8f;
+static const float kStandardMaxOmegaRadps = 0.0f;
+static const float kStandardRcDeadband = 0.05f;
+static const float kStandardChassisWheelRampRadps2 = 80.0f;
+static const float kStandardChassisCurrentLimitA = 2.0f;
 static const float kStandardPitchOffsetRad = -1.66286434f;
 static const float kStandardYawManualScale = 0.5f;
 static const float kStandardPitchMouseScale = 0.5f;
@@ -84,6 +92,7 @@ typedef struct {
   uint8_t fdcan2_tx_data[kStandardCanDataLength];
   uint8_t fdcan3_tx_data[kStandardCanDataLength];
   uint16_t bullet_count;
+  uint32_t chassis_last_tick;
   volatile bool is_initialized;
   volatile bool is_initializing;
 } StandardApp;
@@ -106,6 +115,25 @@ static float StandardClamp(float value, float min, float max) {
 
 static float StandardRcNormalize(int16_t value) {
   return StandardClamp((float)value / 660.0f, -1.0f, 1.0f);
+}
+
+static float StandardApplyDeadband(float value, float deadband) {
+  if (value > -deadband && value < deadband) {
+    return 0.0f;
+  }
+  return value;
+}
+
+static float StandardRampFloat(float current, float target, float step) {
+  if (current < target) {
+    current += step;
+    return (current > target) ? target : current;
+  }
+  if (current > target) {
+    current -= step;
+    return (current < target) ? target : current;
+  }
+  return current;
 }
 
 static void StandardPackDjiCurrents(const DjiMotor *motor_0,
@@ -232,18 +260,29 @@ static void StandardSharedInit(void) {
   (void)osKernelRestoreLock(lock);
 
   StandardMotorInit();
-  FdcanInit(&hfdcan1, StandardFdcan1RxCallback);
-  FdcanInit(&hfdcan2, StandardFdcan2RxCallback);
-  FdcanInit(&hfdcan3, StandardFdcan3RxCallback);
+  if (kStandardGimbalEnabled != 0U || kStandardShootEnabled != 0U) {
+    FdcanInit(&hfdcan1, StandardFdcan1RxCallback);
+  }
+  if (kStandardGimbalEnabled != 0U) {
+    FdcanInit(&hfdcan2, StandardFdcan2RxCallback);
+  }
+  if (kStandardChassisEnabled != 0U || kStandardShootEnabled != 0U) {
+    FdcanInit(&hfdcan3, StandardFdcan3RxCallback);
+  }
   UartInit(&huart5, Dt7RxCallback);
-  UartInit(&huart10, VisionProtocolRxCallback);
+  if (kStandardVisionEnabled != 0U) {
+    UartInit(&huart10, VisionProtocolRxCallback);
+  }
   if (kStandardRefereeEnabled != 0U) {
     RefereeInit(&g_referee, &huart1, &huart1);
   }
 
-  DmMotorPackEnable(&g_standard.yaw_motor, g_standard.fdcan2_tx_data);
-  FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
-                DmMotorTxId(&g_standard.yaw_motor));
+  if (kStandardGimbalEnabled != 0U) {
+    DmMotorPackEnable(&g_standard.yaw_motor, g_standard.fdcan2_tx_data);
+    FdcanTransmit(&hfdcan2, g_standard.fdcan2_tx_data, kStandardCanDataLength,
+                  DmMotorTxId(&g_standard.yaw_motor));
+  }
+  g_standard.chassis_last_tick = osKernelGetTickCount();
   g_standard.is_initialized = true;
   g_standard.is_initializing = false;
 }
@@ -294,12 +333,11 @@ static float StandardChassisPowerLimit(void) {
 }
 
 static void StandardChassisKinematics(void) {
-  float vx_input = -StandardRcNormalize(g_dt7_object.rocker.ch3) -
-                   (float)g_dt7_object.key.w + (float)g_dt7_object.key.s;
-  float vy_input = StandardRcNormalize(g_dt7_object.rocker.ch2) +
-                   (float)g_dt7_object.key.a - (float)g_dt7_object.key.d;
-  float wz_input = -StandardRcNormalize(g_dt7_object.rocker.wheel) -
-                   (float)g_dt7_object.key.q + (float)g_dt7_object.key.e;
+  float vx_input = StandardApplyDeadband(
+      -StandardRcNormalize(g_dt7_object.rocker.ch3), kStandardRcDeadband);
+  float vy_input = StandardApplyDeadband(
+      StandardRcNormalize(g_dt7_object.rocker.ch2), kStandardRcDeadband);
+  float wz_input = 0.0f;
 
   g_standard.chassis.desired_velocity.vx =
       StandardClamp(vx_input, -1.0f, 1.0f) * kStandardMaxVxMps;
@@ -312,24 +350,37 @@ static void StandardChassisKinematics(void) {
   float vy = g_standard.chassis.desired_velocity.vy;
   float wz = g_standard.chassis.desired_velocity.omega_z;
   float rotation_speed = wz * kStandardChassisRadiusM;
+  float target_omega[kStandardMotorCount];
 
-  g_standard.chassis_motor[0].state.given_omega =
+  target_omega[0] =
       (-0.707f * vx + 0.707f * vy + rotation_speed) /
       kStandardWheelRadiusM;
-  g_standard.chassis_motor[1].state.given_omega =
+  target_omega[1] =
       (-0.707f * vx - 0.707f * vy + rotation_speed) /
       kStandardWheelRadiusM;
-  g_standard.chassis_motor[2].state.given_omega =
+  target_omega[2] =
       (0.707f * vx - 0.707f * vy + rotation_speed) /
       kStandardWheelRadiusM;
-  g_standard.chassis_motor[3].state.given_omega =
+  target_omega[3] =
       (0.707f * vx + 0.707f * vy + rotation_speed) / kStandardWheelRadiusM;
+
+  uint32_t now = osKernelGetTickCount();
+  uint32_t elapsed_ms = now - g_standard.chassis_last_tick;
+  g_standard.chassis_last_tick = now;
+  float step = kStandardChassisWheelRampRadps2 * (float)elapsed_ms * 0.001f;
+  for (uint8_t i = 0; i < kStandardMotorCount; i++) {
+    g_standard.chassis_motor[i].state.given_omega = StandardRampFloat(
+        g_standard.chassis_motor[i].state.given_omega, target_omega[i], step);
+  }
 }
 
 static void StandardChassisControl(void) {
   StandardChassisKinematics();
   for (uint8_t i = 0; i < kStandardMotorCount; i++) {
     DjiMotorCurrentCalculate(&g_standard.chassis_motor[i]);
+    g_standard.chassis_motor[i].state.given_current = StandardClamp(
+        g_standard.chassis_motor[i].state.given_current,
+        -kStandardChassisCurrentLimitA, kStandardChassisCurrentLimitA);
   }
   StandardApplyChassisPowerLimit(StandardChassisPowerLimit());
   StandardPackDjiCurrents(&g_standard.chassis_motor[0],
@@ -463,7 +514,11 @@ static bool StandardDt7IsOnline(void) {
 }
 
 static bool StandardIsSafeMode(void) {
-  return !StandardDt7IsOnline() || SwitchIsDown(g_dt7_object.rocker.sw1);
+  if (!StandardDt7IsOnline()) {
+    return true;
+  }
+  return kStandardRemoteSwitchSafeModeEnabled != 0U &&
+         SwitchIsDown(g_dt7_object.rocker.sw1);
 }
 
 static void StandardEnterGimbalSafeMode(void) {
@@ -513,12 +568,17 @@ void ManagerTaskLoop(void) {
   if (kStandardRefereeEnabled != 0U) {
     RefereeUpdate(&g_referee);
   }
-  StandardUpdateVisionTx();
-  VisionProtocolTransmitGimbalState();
+  if (kStandardVisionEnabled != 0U) {
+    StandardUpdateVisionTx();
+    VisionProtocolTransmitGimbalState();
+  }
 }
 
 uint32_t GimbalTaskInit(void) {
   if (StandardIsUnitTestMode()) {
+    return kStandardGimbalPeriodMs;
+  }
+  if (kStandardGimbalEnabled == 0U) {
     return kStandardGimbalPeriodMs;
   }
   StandardSharedInit();
@@ -527,6 +587,9 @@ uint32_t GimbalTaskInit(void) {
 
 void GimbalTaskLoop(void) {
   if (StandardIsUnitTestMode()) {
+    return;
+  }
+  if (kStandardGimbalEnabled == 0U) {
     return;
   }
   if (StandardIsSafeMode()) {
@@ -540,12 +603,18 @@ uint32_t ChassisTaskInit(void) {
   if (StandardIsUnitTestMode()) {
     return kStandardChassisPeriodMs;
   }
+  if (kStandardChassisEnabled == 0U) {
+    return kStandardChassisPeriodMs;
+  }
   StandardSharedInit();
   return kStandardChassisPeriodMs;
 }
 
 void ChassisTaskLoop(void) {
   if (StandardIsUnitTestMode()) {
+    return;
+  }
+  if (kStandardChassisEnabled == 0U) {
     return;
   }
   if (StandardIsSafeMode()) {
@@ -559,12 +628,18 @@ uint32_t ShootTaskInit(void) {
   if (StandardIsUnitTestMode()) {
     return kStandardShootPeriodMs;
   }
+  if (kStandardShootEnabled == 0U) {
+    return kStandardShootPeriodMs;
+  }
   StandardSharedInit();
   return kStandardShootPeriodMs;
 }
 
 void ShootTaskLoop(void) {
   if (StandardIsUnitTestMode()) {
+    return;
+  }
+  if (kStandardShootEnabled == 0U) {
     return;
   }
   if (StandardIsSafeMode()) {
