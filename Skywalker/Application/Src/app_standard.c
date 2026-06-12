@@ -10,6 +10,7 @@
 #include "bsp_fdcan.h"
 #include "bsp_uart.h"
 #include "cmsis_os2.h"
+#include "app_unit_test.h"
 #include "dev_dji_dt7.h"
 #include "dev_dji_motor.h"
 #include "dev_dm_motor.h"
@@ -22,6 +23,8 @@
 enum {
   // 1U: 接入裁判系统；0U: 不接入裁判系统，使用本文件内默认参数。
   kStandardRefereeEnabled = 0U,
+  // 当前测试：FDCAN3上的4个M3508按固定目标速度匀速转动。
+  kStandardUnitTestMask = kUnitTestFdcan3MotorSpin,
   kStandardManagerPeriodMs = 10,
   kStandardGimbalPeriodMs = 2,
   kStandardChassisPeriodMs = 2,
@@ -86,6 +89,10 @@ typedef struct {
 } StandardApp;
 
 static StandardApp g_standard;
+
+static bool StandardIsUnitTestMode(void) {
+  return (uint32_t)kStandardUnitTestMask != (uint32_t)kUnitTestNone;
+}
 
 static float StandardClamp(float value, float min, float max) {
   if (value > max) {
@@ -491,11 +498,18 @@ static void StandardUpdateVisionTx(void) {
 }
 
 uint32_t ManagerTaskInit(void) {
+  if (StandardIsUnitTestMode()) {
+    return UnitTestInit(kStandardUnitTestMask);
+  }
   StandardSharedInit();
   return kStandardManagerPeriodMs;
 }
 
 void ManagerTaskLoop(void) {
+  if (StandardIsUnitTestMode()) {
+    UnitTestLoop();
+    return;
+  }
   if (kStandardRefereeEnabled != 0U) {
     RefereeUpdate(&g_referee);
   }
@@ -504,11 +518,17 @@ void ManagerTaskLoop(void) {
 }
 
 uint32_t GimbalTaskInit(void) {
+  if (StandardIsUnitTestMode()) {
+    return kStandardGimbalPeriodMs;
+  }
   StandardSharedInit();
   return kStandardGimbalPeriodMs;
 }
 
 void GimbalTaskLoop(void) {
+  if (StandardIsUnitTestMode()) {
+    return;
+  }
   if (StandardIsSafeMode()) {
     StandardEnterGimbalSafeMode();
     return;
@@ -517,11 +537,17 @@ void GimbalTaskLoop(void) {
 }
 
 uint32_t ChassisTaskInit(void) {
+  if (StandardIsUnitTestMode()) {
+    return kStandardChassisPeriodMs;
+  }
   StandardSharedInit();
   return kStandardChassisPeriodMs;
 }
 
 void ChassisTaskLoop(void) {
+  if (StandardIsUnitTestMode()) {
+    return;
+  }
   if (StandardIsSafeMode()) {
     StandardEnterChassisSafeMode();
     return;
@@ -530,11 +556,17 @@ void ChassisTaskLoop(void) {
 }
 
 uint32_t ShootTaskInit(void) {
+  if (StandardIsUnitTestMode()) {
+    return kStandardShootPeriodMs;
+  }
   StandardSharedInit();
   return kStandardShootPeriodMs;
 }
 
 void ShootTaskLoop(void) {
+  if (StandardIsUnitTestMode()) {
+    return;
+  }
   if (StandardIsSafeMode()) {
     StandardEnterShootSafeMode();
     return;
